@@ -462,7 +462,7 @@ function seedTemplates(){
   return t;
 }
 function defaultState(){return {v:3,exercises:seedExercises(),templates:seedTemplates(),sessions:[],active:null,deleted:{},
-  settings:{rest:90,step:1,lastBackup:null,voice:true,keepAwake:true,clientId:'',lastSync:null},
+  settings:{rest:90,step:1,lastBackup:null,voice:true,keepAwake:true,fbKey:'',fbProject:'',lastSync:null,lastPull:0,lastPush:0},
   theme:{preset:'neon',...THEMES.neon,fx:{impact:false,aura:false},wallOp:.8,wallBlur:0,hasWall:false,hasIllu:false,wallId:null,wallRandom:false,autoColors:true}}}
 function load(){
   try{const raw=localStorage.getItem(KEY);if(raw)S=JSON.parse(raw)}catch(e){}
@@ -691,7 +691,7 @@ function renderTabs(){
   tabsEl.innerHTML=T.map(([k,l,i])=>`<button class="tab ${ui.tab===k?'on':''}" data-act="tab" data-id="${k}">${i}<span>${l}</span>${k==='workout'&&S.active&&ui.tab!=='workout'?'<i class="dot"></i>':''}</button>`).join('');
 }
 function syncDot(){
-  if(!S.settings.clientId||!AUTH)return '';
+  if(!fbOn()||!AUTH)return '';
   const c={ok:'var(--ok)',syncing:'var(--blue)',error:'var(--red)',expired:'var(--warm)'}[syncState]||'transparent';
   return `<i class="sdot" style="background:${c}"></i>`;
 }
@@ -723,11 +723,11 @@ function viewHTML(){
 
 /* ----- Accueil ----- */
 function topBanner(){
-  if(S.settings.clientId&&syncState==='expired')return `<button class="banner" data-act="mslogin">${IC.cloud}<span>Reconnecte OneDrive pour reprendre la synchro (1 tap)</span></button>`;
-  if(S.settings.clientId&&AUTH)return '';
+  if(fbOn()&&syncState==='expired')return `<button class="banner" data-act="settings">${IC.cloud}<span>Session de synchro expirée — reconnecte-toi</span></button>`;
+  if(fbOn()&&AUTH)return '';
   const lb=S.settings.lastBackup;const n=sessions().length;
   if(!n||(lb&&Date.now()-lb<7*864e5))return '';
-  return `<button class="banner" data-act="settings">${IC.cloud}<span>${lb?'Dernière sauvegarde il y a '+Math.floor((Date.now()-lb)/864e5)+' jours':'Tes données ne sont pas encore sauvegardées'} — activer la synchro OneDrive</span></button>`;
+  return `<button class="banner" data-act="settings">${IC.cloud}<span>${lb?'Dernière sauvegarde il y a '+Math.floor((Date.now()-lb)/864e5)+' jours':'Tes données ne sont pas encore sauvegardées'} — activer la synchro</span></button>`;
 }
 function tplLine(t){return t.items.map(i=>esc(itemName(i))).join(' · ')||'Vide'}
 function idleHTML(){
@@ -1308,7 +1308,6 @@ const A={
   back:()=>{ui.stack.pop();render()},
   settings:()=>settingsSheet(),
   theme:()=>themeSheet(),
-  mslogin:()=>msLogin(),
   startfree:()=>startSession(null),
   quickhiit:()=>hiitSheet({mode:'tabata'},h=>{const s=S.active?S.sessions.find(x=>x.id===S.active):startSession(null,null,{name:h.name||'HIIT '+HMODE[h.mode].label});if(!s)return;const it=makeHiit(h);s.items.push(it);save();go('workout');openTimer('sess:'+s.id,it.id)},{cta:'▶ Lancer'}),
   starttpl:c=>startSession(S.templates.find(t=>t.id===c.id)),
@@ -1525,93 +1524,107 @@ function themeSheet(){
   draw();
 }
 
-/* =================== Synchro OneDrive =================== */
-const MS={auth:'https://login.microsoftonline.com/consumers/oauth2/v2.0',graph:'https://graph.microsoft.com/v1.0',scope:'Files.ReadWrite.AppFolder offline_access',file:'/me/drive/special/approot:/forge-data.json'};
+/* =================== Synchro Firebase (Firestore REST) =================== */
+const fbOn=()=>!!(S.settings.fbKey&&S.settings.fbProject);
 let AUTH=null,syncState='idle',syncing=false,syncDirty=false,syncT=null;
-try{AUTH=JSON.parse(localStorage.getItem('forge-auth')||'null')}catch(e){}
-const saveAuth=()=>{try{AUTH?localStorage.setItem('forge-auth',JSON.stringify(AUTH)):localStorage.removeItem('forge-auth')}catch(e){}};
-const redirectUri=()=>location.origin+location.pathname;
-const b64url=a=>btoa(String.fromCharCode(...a)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-function setSync(s){syncState=s;renderHeader();const el=$('#syncst');if(el)el.innerHTML=syncStatusHTML()}
-async function msLogin(){
-  if(!S.settings.clientId){settingsSheet();return}
-  if(!window.crypto?.subtle){toast('Connexion possible uniquement sur la version en ligne (https)');return}
-  const v=b64url(crypto.getRandomValues(new Uint8Array(32)));
-  const c=b64url(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(v))));
-  const st=uid();try{localStorage.setItem('forge-pkce',JSON.stringify({v,st}))}catch(e){}
-  stamp();saveNow();
-  location.href=MS.auth+'/authorize?'+new URLSearchParams({client_id:S.settings.clientId,response_type:'code',redirect_uri:redirectUri(),scope:MS.scope,code_challenge:c,code_challenge_method:'S256',state:st,response_mode:'query'});
+try{AUTH=JSON.parse(localStorage.getItem('forge-fb')||'null')}catch(e){}
+const saveAuth=()=>{try{AUTH?localStorage.setItem('forge-fb',JSON.stringify(AUTH)):localStorage.removeItem('forge-fb')}catch(e){}};
+const fbBase=()=>`https://firestore.googleapis.com/v1/projects/${S.settings.fbProject}/databases/(default)/documents`;
+function setSync(st){syncState=st;renderHeader();const el=$('#syncst');if(el)el.innerHTML=syncStatusHTML()}
+function fbErr(m=''){
+  const M={EMAIL_EXISTS:'Un compte existe déjà avec cet e-mail : utilise « Se connecter ».',EMAIL_NOT_FOUND:'Aucun compte avec cet e-mail : utilise « Créer mon compte ».',INVALID_PASSWORD:'Mot de passe incorrect.',INVALID_LOGIN_CREDENTIALS:'E-mail ou mot de passe incorrect.',INVALID_EMAIL:'Adresse e-mail invalide.',MISSING_PASSWORD:'Entre un mot de passe.',WEAK_PASSWORD:'Mot de passe trop court (6 caractères minimum).',OPERATION_NOT_ALLOWED:'Active « Adresse e-mail/Mot de passe » dans Firebase › Authentication.',CONFIGURATION_NOT_FOUND:'Active Authentication dans la console Firebase.',TOO_MANY_ATTEMPTS_TRY_LATER:'Trop d’essais, réessaie dans quelques minutes.',USER_DISABLED:'Ce compte est désactivé.'};
+  if(/API key not valid|API_KEY_INVALID/.test(m))return 'Clé API invalide : vérifie-la dans les Réglages.';
+  const k=Object.keys(M).find(k=>m.startsWith(k));return k?M[k]:(m||'Pas de connexion internet');
 }
-async function tokenReq(body){
-  const r=await fetch(MS.auth+'/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:S.settings.clientId,scope:MS.scope,...body})});
-  const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error_description||j.error||('HTTP '+r.status));return j;
+async function fbAuth(path,body){
+  const r=await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:${path}?key=${encodeURIComponent(S.settings.fbKey)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(fbErr(j.error?.message));return j;
 }
-function storeTokens(j,fresh){AUTH={access:j.access_token,exp:Date.now()+((j.expires_in||3600)-120)*1000,refresh:j.refresh_token||AUTH?.refresh,rexp:fresh?Date.now()+23.5*3600e3:(AUTH?.rexp||0)};saveAuth()}
-async function handleRedirect(){
-  const p=new URLSearchParams(location.search);if(!p.get('code')&&!p.get('error'))return;
-  let saved={};try{saved=JSON.parse(localStorage.getItem('forge-pkce')||'{}');localStorage.removeItem('forge-pkce')}catch(e){}
-  history.replaceState(null,'',redirectUri());
-  if(p.get('error')){toast('Connexion OneDrive annulée');return}
-  if(p.get('state')!==saved.st){toast('Connexion OneDrive invalide, réessaie');return}
-  try{storeTokens(await tokenReq({grant_type:'authorization_code',code:p.get('code'),redirect_uri:redirectUri(),code_verifier:saved.v}),true);toast('OneDrive connecté ✔');await sync()}
-  catch(e){toast('Échec de connexion : '+e.message);setSync('error')}
+function setAuth(j){AUTH={id:j.idToken||j.id_token,exp:Date.now()+((+(j.expiresIn||j.expires_in)||3600)-120)*1000,refresh:j.refreshToken||j.refresh_token,uid:j.localId||j.user_id,email:j.email||AUTH?.email};saveAuth()}
+async function fbSignIn(email,pw,create){
+  setAuth(await fbAuth(create?'signUp':'signInWithPassword',{email,password:pw,returnSecureToken:true}));
+  S.settings.lastPull=0;S.settings.lastPush=0;save();setSync('idle');await sync();
 }
 async function getToken(){
-  if(!AUTH)return null;
-  if(AUTH.access&&Date.now()<AUTH.exp)return AUTH.access;
-  if(AUTH.refresh&&Date.now()<AUTH.rexp){try{storeTokens(await tokenReq({grant_type:'refresh_token',refresh_token:AUTH.refresh}),false);return AUTH.access}catch(e){}}
-  AUTH.access=null;saveAuth();setSync('expired');return null;
+  if(!AUTH)return null;if(AUTH.id&&Date.now()<AUTH.exp)return AUTH.id;
+  try{const r=await fetch(`https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(S.settings.fbKey)}`,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({grant_type:'refresh_token',refresh_token:AUTH.refresh})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok){if(r.status===400||r.status===401){AUTH.id=null;saveAuth();setSync('expired')}return null}
+    setAuth(j);return AUTH.id}catch(e){return null}
 }
-function syncPayload(){return {app:'forge',v:2,at:Date.now(),exercises:S.exercises,templates:S.templates,sessions:S.sessions.filter(s=>s.end),deleted:S.deleted}}
 function mergeData(d){
   const del={...(S.deleted||{})};Object.entries(d.deleted||{}).forEach(([k,v])=>{if(!del[k]||v>del[k])del[k]=v});
   const cut=Date.now()-150*864e5;Object.keys(del).forEach(k=>{if(del[k]<cut)delete del[k]});S.deleted=del;
   const m=(a,b)=>{const map=new Map(a.map(x=>[x.id,x]));(b||[]).forEach(x=>{const l=map.get(x.id);if(!l||(x.u||0)>(l.u||0))map.set(x.id,x)});return [...map.values()].filter(x=>!(del[x.id]&&del[x.id]>=(x.u||0)))};
   S.exercises=m(S.exercises,d.exercises);S.templates=m(S.templates,d.templates);
   const act=S.sessions.find(s=>s.id===S.active);
-  S.sessions=m(S.sessions.filter(s=>s.end),(d.sessions||[]).filter(s=>s.end));if(act)S.sessions.push(act);
+  S.sessions=m(S.sessions.filter(s=>s.end),(d.sessions||[]).filter(s=>s.end));if(act&&!S.sessions.includes(act))S.sessions.push(act);
   SIG.clear();stamp(true);
 }
 async function sync(){
-  if(syncing||!S.settings.clientId||!AUTH)return;
-  const t=await getToken();if(!t)return;
+  if(syncing||!fbOn()||!AUTH)return;
+  const t=await getToken();if(!t){if(syncState!=='expired')setSync('error');return}
   syncing=true;syncDirty=false;setSync('syncing');
   try{
-    const H={Authorization:'Bearer '+t};
-    const r=await fetch(MS.graph+MS.file,{headers:H});
-    if(r.ok){const meta=await r.json();const d=await (await fetch(meta['@microsoft.graph.downloadUrl'])).json();if(d&&d.app==='forge')mergeData(d)}
-    else if(r.status!==404)throw new Error('lecture '+r.status);
-    const u=await fetch(MS.graph+MS.file+':/content',{method:'PUT',headers:{...H,'Content-Type':'application/json'},body:JSON.stringify(syncPayload())});
-    if(!u.ok)throw new Error('écriture '+u.status);
-    S.settings.lastSync=Date.now();S.settings.lastBackup=Date.now();saveNow();setSync('ok');
+    const H={Authorization:'Bearer '+t,'Content-Type':'application/json'};const base=fbBase();
+    const docPath=id=>`projects/${S.settings.fbProject}/databases/(default)/documents/users/${AUTH.uid}/items/${id}`;
+    // 1) Récupérer ce qui a changé ailleurs
+    const since=Math.max(0,(S.settings.lastPull||0)-10*60e3);
+    const r=await fetch(`${base}/users/${AUTH.uid}:runQuery`,{method:'POST',headers:H,body:JSON.stringify({structuredQuery:{from:[{collectionId:'items'}],where:{fieldFilter:{field:{fieldPath:'u'},op:'GREATER_THAN',value:{integerValue:String(since)}}}}})});
+    if(!r.ok)throw new Error('lecture '+r.status+' '+(await r.text()).slice(0,300));
+    const rows=(await r.json()).filter(x=>x.document);
+    const inc={exercises:[],templates:[],sessions:[],deleted:{}};let maxU=S.settings.lastPull||0;
+    rows.forEach(x=>{const f=x.document.fields||{};const k=f.k?.stringValue,u=+(f.u?.integerValue||0);const id=x.document.name.split('/').pop();if(u>maxU)maxU=u;
+      if(k==='del'){inc.deleted[id]=u;return}
+      let o=null;try{o=JSON.parse(f.j?.stringValue||'null')}catch(e){}if(!o)return;o.u=u;
+      ({ex:inc.exercises,tpl:inc.templates,sess:inc.sessions})[k]?.push(o)});
+    if(rows.length)mergeData(inc);
+    // 2) Envoyer ce qui a changé ici
+    stamp();const lp=S.settings.lastPush||0;const W=[];
+    const doc=(id,k,u,o)=>({update:{name:docPath(id),fields:{k:{stringValue:k},u:{integerValue:String(u)},...(o?{j:{stringValue:JSON.stringify(o)}}:{})}}});
+    S.exercises.forEach(o=>{if((o.u||0)>lp)W.push(doc(o.id,'ex',o.u,o))});
+    S.templates.forEach(o=>{if((o.u||0)>lp)W.push(doc(o.id,'tpl',o.u,o))});
+    S.sessions.forEach(o=>{if(o.end&&(o.u||0)>lp)W.push(doc(o.id,'sess',o.u,o))});
+    Object.entries(S.deleted||{}).forEach(([id,ts])=>{if(ts>lp)W.push(doc(id,'del',ts))});
+    const t0=Date.now();
+    for(let i=0;i<W.length;i+=400){const w=await fetch(`${base}:commit`,{method:'POST',headers:H,body:JSON.stringify({writes:W.slice(i,i+400)})});
+      if(!w.ok)throw new Error('écriture '+w.status+' '+(await w.text()).slice(0,300))}
+    W.forEach(x=>{const u=+x.update.fields.u.integerValue;if(u>maxU)maxU=u});
+    S.settings.lastPush=t0;S.settings.lastPull=maxU;S.settings.lastSync=Date.now();S.settings.lastBackup=Date.now();saveNow();setSync('ok');
     if(!curSheet&&!HT&&!document.activeElement?.matches('input,textarea'))render();
-  }catch(e){console.warn('sync',e);syncDirty=true;setSync('error')}
+  }catch(e){console.warn('sync',e);syncDirty=true;S.settings.lastSyncErr=String(e.message||e).slice(0,160);setSync('error')}
   finally{syncing=false}
 }
-function scheduleSync(){if(!S.settings.clientId||!AUTH)return;syncDirty=true;clearTimeout(syncT);syncT=setTimeout(sync,20000)}
-function syncSoon(ms=1500){if(!S.settings.clientId||!AUTH)return;clearTimeout(syncT);syncT=setTimeout(sync,ms)}
+function scheduleSync(){if(!fbOn()||!AUTH)return;syncDirty=true;clearTimeout(syncT);syncT=setTimeout(sync,15000)}
+function syncSoon(ms=1500){if(!fbOn()||!AUTH)return;clearTimeout(syncT);syncT=setTimeout(sync,ms)}
+window.addEventListener('online',()=>syncSoon(1000));
 function syncStatusHTML(){
-  if(!S.settings.clientId)return '';
+  if(!fbOn())return '';
   if(!AUTH)return `<span class="muted">Non connecté</span>`;
   const ls=S.settings.lastSync?new Date(S.settings.lastSync).toLocaleString('fr-FR',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}):'jamais';
-  return {syncing:'<b style="color:var(--blue)">Synchronisation…</b>',error:`<b style="color:var(--red)">Erreur de synchro</b> · dernière réussie : ${ls}`,expired:'<b style="color:var(--warm)">Session expirée</b> — reconnecte-toi'}[syncState]||`<b style="color:var(--ok)">Connecté</b> · dernière synchro : ${ls}`;
+  return {syncing:'<b style="color:var(--blue)">Synchronisation…</b>',error:`<b style="color:var(--red)">Synchro impossible</b> (hors ligne ?) · dernière réussie : ${ls}${S.settings.lastSyncErr?`<div class="small muted" style="margin-top:4px">${esc(S.settings.lastSyncErr)}</div>`:''}`,expired:'<b style="color:var(--warm)">Session expirée</b> — reconnecte-toi'}[syncState]||`<b style="color:var(--ok)">Synchronisé</b> · ${esc(AUTH.email||'')} · ${ls}`;
 }
 
 /* =================== Réglages =================== */
 function settingsSheet(){
   const st=S.settings;const hosted=location.protocol==='https:';
   const sh=sheet(head('Réglages')+`<div class="sh-body">
-   <div class="section-t" style="margin-top:4px">Synchro OneDrive</div>
-   <div class="card" style="margin-top:0">
-    ${!st.clientId?`<div class="small muted" style="margin-bottom:10px">Tes données seront enregistrées automatiquement dans <b style="color:var(--txt)">OneDrive › Applications › Forge</b>. Colle ici l’ID d’application obtenu pendant la configuration (je te guide).</div>
-      <input class="field" id="cid" placeholder="ID d’application (client ID)" autocomplete="off" autocapitalize="off" spellcheck="false">
-      <button class="btn primary block" id="cidok" style="margin-top:8px">Enregistrer</button>
-      <div class="small muted" style="margin-top:8px">Adresse de redirection à déclarer : <b style="color:var(--txt);user-select:all;-webkit-user-select:all">${esc(redirectUri())}</b></div>`
+   <div class="section-t" style="margin-top:4px">Synchro automatique</div>
+   <div class="card" style="margin-top:0" id="sync-card">
+    ${!fbOn()?`<div class="small muted" style="margin-bottom:10px">Tes séances, programmes et exercices seront sauvegardés dans ton propre projet Firebase (Google), et partagés entre tes appareils. Colle ici les deux valeurs de ton projet (je te guide).</div>
+      <label class="lbl" style="margin-top:0">Clé API (apiKey)</label><input class="field" id="fk" placeholder="AIza…" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <label class="lbl">ID du projet (projectId)</label><input class="field" id="fp" placeholder="forge-12345" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button class="btn primary block" id="fok" style="margin-top:10px">Enregistrer</button>`
+    :!AUTH||syncState==='expired'?`<div class="small muted" style="margin-bottom:10px">Connecte-toi (ou crée ton compte la première fois). Utilise le même e-mail sur tous tes appareils.</div>
+      <input class="field" id="em" type="email" placeholder="E-mail" autocomplete="username" value="${esc(AUTH?.email||'')}" autocapitalize="off">
+      <input class="field" id="pw" type="password" placeholder="Mot de passe (6 caractères min.)" autocomplete="current-password" style="margin-top:8px">
+      <div class="small" id="ferr" style="color:var(--red);margin-top:8px;display:none"></div>
+      <div class="row" style="margin-top:10px"><button class="btn primary grow" id="fin">Se connecter</button><button class="btn grow" id="fup">Créer mon compte</button></div>
+      <button class="link" id="frs" style="padding-bottom:0;font-size:13px">Mot de passe oublié</button>
+      <button class="link" id="fcfg" style="padding:6px 0 0;font-size:13px">Changer de projet Firebase</button>`
     :`<div class="small" id="syncst" style="margin-bottom:12px">${syncStatusHTML()}</div>
-      ${AUTH&&syncState!=='expired'?`<button class="btn primary block" id="snow">${IC.sync} Synchroniser maintenant</button><button class="link" id="sout" style="padding-bottom:0">Se déconnecter</button>`
-        :`<button class="btn primary block" id="slog">${IC.cloud} Se connecter à OneDrive</button>`}
-      ${!hosted?'<div class="small" style="color:var(--warm);margin-top:10px">La connexion fonctionne une fois l’app mise en ligne (adresse https).</div>':''}
-      <button class="link" id="cidx" style="padding-bottom:0;font-size:13px">Changer l’ID d’application</button>`}
+      <button class="btn primary block" id="snow">${IC.sync} Synchroniser maintenant</button>
+      <button class="link" id="sout" style="padding-bottom:0">Se déconnecter</button>`}
    </div>
    <div class="section-t">Sauvegarde manuelle</div>
    <div class="card" style="margin-top:0">
@@ -1632,11 +1645,22 @@ function settingsSheet(){
    <div class="small muted" style="margin:22px 4px 0;text-align:center">Forge · ${S.exercises.filter(e=>!e.archived).length} exercices · ${sessions().length} séances</div>
   </div>`);
   const q=s=>sh.el.querySelector(s);
-  if(q('#cidok'))q('#cidok').onclick=()=>{const v=q('#cid').value.trim();if(!/^[0-9a-f-]{36}$/i.test(v)){toast('ID invalide (format : xxxxxxxx-xxxx-…)');return}st.clientId=v;save();sh.close();later(settingsSheet)};
-  if(q('#cidx'))q('#cidx').onclick=()=>{st.clientId='';AUTH=null;saveAuth();save();sh.close();later(settingsSheet)};
-  if(q('#slog'))q('#slog').onclick=msLogin;
+  const err=m=>{const e=q('#ferr');if(e){e.textContent=m;e.style.display='block'}else toast(m)};
+  if(q('#fok'))q('#fok').onclick=()=>{const k=q('#fk').value.trim(),pid=q('#fp').value.trim();
+    if(!/^AIza[\w-]{20,}$/.test(k)){toast('Clé API invalide (elle commence par « AIza »)');return}
+    if(!/^[a-z0-9-]{4,40}$/.test(pid)){toast('ID de projet invalide (minuscules, chiffres, tirets)');return}
+    st.fbKey=k;st.fbProject=pid;save();sh.close();later(settingsSheet)};
+  const go=async create=>{const em=q('#em').value.trim(),pw=q('#pw').value;if(!em||!pw){err('Entre ton e-mail et ton mot de passe.');return}
+    ['#fin','#fup'].forEach(x=>q(x).disabled=true);
+    try{await fbSignIn(em,pw,create);sh.close();toast(create?'Compte créé, synchro activée ✔':'Connecté, synchro activée ✔');render()}
+    catch(e){err(e.message);['#fin','#fup'].forEach(x=>q(x)&&(q(x).disabled=false))}};
+  if(q('#fin'))q('#fin').onclick=()=>go(false);
+  if(q('#fup'))q('#fup').onclick=()=>go(true);
+  if(q('#frs'))q('#frs').onclick=async()=>{const em=q('#em').value.trim();if(!em){err('Entre d’abord ton e-mail.');return}
+    try{await fbAuth('sendOobCode',{requestType:'PASSWORD_RESET',email:em});toast('E-mail de réinitialisation envoyé')}catch(e){err(e.message)}};
+  if(q('#fcfg'))q('#fcfg').onclick=()=>{st.fbKey='';st.fbProject='';AUTH=null;saveAuth();save();sh.close();later(settingsSheet)};
   if(q('#snow'))q('#snow').onclick=()=>{stamp();sync()};
-  if(q('#sout'))q('#sout').onclick=()=>{AUTH=null;saveAuth();setSync('idle');sh.close();toast('Déconnecté de OneDrive')};
+  if(q('#sout'))q('#sout').onclick=()=>{AUTH=null;saveAuth();setSync('idle');sh.close();toast('Déconnecté — tes données restent sur ce téléphone')};
   q('#exp').onclick=exportData;
   q('#imp').onclick=()=>$('#importfile').click();
   q('#rest').onclick=()=>{sh.close();later(()=>restSheet(st.rest,v=>{st.rest=v;save();render();later(settingsSheet)},{title:'Repos par défaut'}))};
@@ -1716,8 +1740,9 @@ function makeIcon(){try{const c=document.createElement('canvas');c.width=c.heigh
 
 load();applyTheme();makeIcon();render();
 loadImages().then(()=>{applyTheme();render()});
+try{if('serviceWorker' in navigator&&location.protocol==='https:'&&!location.hostname.endsWith('claude.ai')&&!location.hostname.endsWith('claudeusercontent.com'))navigator.serviceWorker.register('sw.js').catch(()=>{})}catch(e){}
 if(S.active)wake(true);
-handleRedirect().then(()=>{if(AUTH&&S.settings.clientId)syncSoon(800)});
+if(AUTH&&fbOn())syncSoon(800);
 </script>
 </body>
 </html>
