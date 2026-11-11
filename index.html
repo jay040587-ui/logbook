@@ -577,7 +577,7 @@ function seedTemplates(){
   return t;
 }
 function defaultState(){return {v:3,exercises:seedExercises(),templates:seedTemplates(),sessions:[],active:null,deleted:{},
-  settings:{rest:90,step:1,lastBackup:null,voice:true,keepAwake:true,fbKey:'',fbProject:'',lastSync:null,lastPull:0,lastPush:0,lang:'fr',font:'varsity'},profile:{id:'profile',name:'',sex:'',birth:'',height:'',activity:1.55,goal:'maintain',avatar:'kito',coach:true},body:[],
+  settings:{rest:90,step:1,lastBackup:null,voice:true,keepAwake:true,fbKey:'',fbProject:'',lastSync:null,lastPull:0,lastPush:0,lang:'fr',font:'varsity'},profile:{id:'profile',name:'',sex:'',birth:'',height:'',job:'desk',sessW:3,goal:'maintain',avatar:'kito',coach:true,autoCal:true,calAdj:0,adjAt:0,adjLog:[]},body:[],
   theme:{preset:'neon',...THEMES.neon,fx:{impact:false,aura:false},wallOp:.8,wallBlur:0,hasWall:false,hasIllu:false,wallId:null,wallRandom:false,autoColors:true}}}
 function load(){
   try{const raw=localStorage.getItem(KEY);if(raw)S=JSON.parse(raw)}catch(e){}
@@ -592,7 +592,7 @@ function load(){
     S.v=3}
   S.settings=Object.assign({},d.settings,S.settings||{});
   S.theme=Object.assign({},d.theme,S.theme||{});S.theme.fx=Object.assign({impact:false,aura:false},S.theme.fx||{});
-  S.deleted=S.deleted||{};S.body=S.body||[];S.profile=Object.assign({},d.profile,S.profile||{});
+  S.deleted=S.deleted||{};S.body=S.body||[];S.profile=Object.assign({},d.profile,S.profile||{});if(!['cut','soft','maintain','lean','bulk'].includes(S.profile.goal))S.profile.goal='maintain';S.profile.adjLog=S.profile.adjLog||[];
   stamp(true);
 }
 /* Horodatage automatique des enregistrements modifiés (pour la synchro) */
@@ -880,7 +880,7 @@ function viewHTML(){
   if(s){if(s.type==='debrief')return debriefHTML(s.id);if(s.type==='ex')return exDetailHTML(s.id);if(s.type==='tpl')return tplEditHTML(s.id);if(s.type==='sess')return sessDetailHTML(s.id)}
   if(ui.tab==='workout')return S.active?activeHTML():idleHTML();
   if(ui.tab==='programs')return `<div class="seg segtop"><button class="${ui.pseg!=='ex'?'on':''}" data-act="pseg" data-id="tpl">Programmes</button><button class="${ui.pseg==='ex'?'on':''}" data-act="pseg" data-id="ex">Exercices</button></div>`+(ui.pseg==='ex'?exercisesHTML():programsHTML());
-  if(ui.tab==='profile')return profileHTML();
+  if(ui.tab==='profile'){adaptCalories();return profileHTML()}
   if(ui.tab==='history')return historyHTML();
   if(ui.tab==='stats')return statsHTML();
   return exercisesHTML();
@@ -1242,16 +1242,56 @@ function debriefMsg(s,I,st){
 }
 
 /* =================== Profil, pesées, calories =================== */
-const ACT=[[1.2,'Sédentaire','Peu ou pas d’activité'],[1.375,'Légèrement actif','1 à 3 séances par semaine'],[1.55,'Modérément actif','3 à 5 séances par semaine'],[1.725,'Très actif','6 à 7 séances par semaine'],[1.9,'Extrêmement actif','Travail physique + entraînement']];
-const GOALS={cut:['Perte de gras',-.2,2.2],maintain:['Maintien',0,1.8],bulk:['Prise de muscle',.1,2]};
+/* Métier (activité hors entraînement) : facteur appliqué au métabolisme de base */
+const JOBS={desk:[1.3,'Assis la plupart du temps','Bureau, enseignement en salle, conduite…','Mostly sitting','Office, classroom teaching, driving…'],
+  mixed:[1.45,'Mixte','Alternance assis / debout, déplacements','Mixed','Sitting and standing, moving around'],
+  standing:[1.6,'Debout et en mouvement','Commerce, soins, restauration…','On your feet','Retail, care work, catering…'],
+  physical:[1.8,'Travail physique','Bâtiment, manutention, agriculture…','Physical job','Construction, handling, farming…']};
+/* Objectifs : ajustement calorique + rythme visé (% du poids par semaine) + protéines g/kg */
+const GOALS={cut:['Perte de gras',-.2,-.0075,2.2,'Fat loss'],soft:['Sèche douce',-.1,-.004,2.2,'Gentle cut'],maintain:['Maintien',0,0,1.8,'Maintenance'],lean:['Prise propre',.05,.0015,2,'Lean gain'],bulk:['Prise de muscle',.1,.003,2,'Muscle gain']};
+const goalName=k=>L(GOALS[k][0],GOALS[k][4]);
 const bodySorted=()=>S.body.slice().sort((a,b)=>b.date-a.date);
+function lastFat(){const b=bodySorted().find(x=>x.fat&&x.date>Date.now()-60*864e5);return b?+b.fat:null}
+/* Dépense des entraînements : moyenne journalière sur 28 jours à partir de l'historique (MET nets) */
+function trainingKcal(w){
+  const from=Date.now()-28*864e5;const L4=sessions().filter(s=>s.start>=from);
+  if(L4.length<2){const n=+S.profile.sessW||0;return {kcal:Math.round(n*4*w*1/7),from:'declared',n}}
+  let k=0;L4.forEach(s=>{const h=Math.min(2,Math.max(.25,(s.end-s.start)/3600e3));const it=flat(s.items);const card=it.filter(i=>isH(i)||(!isG(i)&&exById(i.exId).type==='c')).length;const met=card*2>=it.length&&it.length?7:5;k+=(met-1)*w*h});
+  return {kcal:Math.round(k/28),from:'history',n:L4.length};
+}
+/* Tendance de poids : régression linéaire, en kg par semaine */
+function weightTrend(fromTs){
+  const B=S.body.filter(b=>b.date>=fromTs).sort((a,b)=>a.date-b.date);if(B.length<3)return null;
+  const span=(B.at(-1).date-B[0].date)/864e5;if(span<13)return null;
+  const xs=B.map(b=>(b.date-B[0].date)/864e5),ys=B.map(b=>+b.weight);const mx=xs.reduce((a,b)=>a+b)/xs.length,my=ys.reduce((a,b)=>a+b)/ys.length;
+  let num=0,den=0;xs.forEach((x,i)=>{num+=(x-mx)*(ys[i]-my);den+=(x-mx)**2});
+  return {perWeek:den?num/den*7:0,n:B.length,days:Math.round(span)};
+}
 function calories(){
   const P=S.profile,w=bodySorted()[0]?.weight;if(!w||!P.height||!P.birth||!P.sex)return null;
-  const age=new Date().getFullYear()-(+P.birth);const g=GOALS[P.goal]||GOALS.maintain;
-  const bmr=10*w+6.25*(+P.height)-5*age+(P.sex==='f'?-161:5);const tdee=bmr*(+P.activity||1.55);
-  let kcal=tdee*(1+g[1]);if(g[1]<0)kcal=Math.max(kcal,bmr,P.sex==='f'?1200:1500);kcal=Math.round(kcal/10)*10;
-  const prot=Math.round(w*g[2]),fat=Math.round(Math.max(w*.8,kcal*.25/9)),carbs=Math.max(0,Math.round((kcal-prot*4-fat*9)/4));
-  return {bmr:Math.round(bmr),tdee:Math.round(tdee),kcal,prot,fat,carbs,age,w};
+  const age=new Date().getFullYear()-(+P.birth);const g=GOALS[P.goal]||GOALS.maintain;const fat=lastFat();
+  const msj=10*w+6.25*(+P.height)-5*age+(P.sex==='f'?-161:5);
+  const lbm=fat?w*(1-fat/100):null;const bmr=fat?370+21.6*lbm:msj;
+  const job=JOBS[P.job]||JOBS.desk;const daily=bmr*job[0];const tr=trainingKcal(w);
+  const tdee=daily+tr.kcal;let base=tdee*(1+g[1]);const adj=P.autoCal?(+P.calAdj||0):0;let kcal=base+adj;
+  const floor=Math.max(P.sex==='f'?1200:1500,g[1]<0?bmr:0);let floored=false;if(kcal<floor){kcal=floor;floored=true}
+  kcal=Math.round(kcal/10)*10;
+  const prot=Math.round(w*g[3]),fatg=Math.round(Math.max(w*.8,kcal*.25/9)),carbs=Math.max(0,Math.round((kcal-prot*4-fatg*9)/4));
+  return {bmr:Math.round(bmr),formula:fat?'katch':'msj',fatPct:fat,daily:Math.round(daily),jobF:job[0],train:tr,tdee:Math.round(tdee),goalPct:g[1],adj,kcal,floored,prot,fat:fatg,carbs,age,w,targetRate:g[2]*w};
+}
+/* Ajustement automatique : compare la tendance réelle au rythme visé, toutes les 2 semaines au plus */
+function adaptCalories(){
+  const P=S.profile;if(!P.autoCal)return null;const C=calories();if(!C)return null;
+  const since=Math.max(P.adjAt||0,Date.now()-28*864e5);
+  if(P.adjAt&&Date.now()-P.adjAt<14*864e5)return null;
+  const T=weightTrend(since);if(!T)return null;
+  const diff=C.targetRate-T.perWeek;           // kg/sem manquants (+) ou en trop (−)
+  let delta=Math.round(diff*7700/7*.5/10)*10;  // moitié de la correction théorique, pour éviter les à-coups
+  delta=Math.max(-300,Math.min(300,delta));
+  if(Math.abs(diff)<.1||Math.abs(delta)<50){P.adjAt=Date.now();P.adjLog.unshift({at:Date.now(),delta:0,obs:T.perWeek,target:C.targetRate});P.adjLog=P.adjLog.slice(0,12);save();return null}
+  P.calAdj=Math.max(-800,Math.min(800,(+P.calAdj||0)+delta));P.adjAt=Date.now();
+  P.adjLog.unshift({at:Date.now(),delta,obs:T.perWeek,target:C.targetRate});P.adjLog=P.adjLog.slice(0,12);save();
+  return {delta,obs:T.perWeek,target:C.targetRate};
 }
 function bmiCat(b){return b<18.5?L('insuffisance pondérale','underweight'):b<25?L('corpulence normale','normal'):b<30?L('surpoids','overweight'):L('obésité','obesity')}
 function profileHTML(){
@@ -1263,7 +1303,7 @@ function profileHTML(){
   const F=pts.filter(b=>b.fat).map(b=>({x:dfmt(b.date,{day:'numeric',month:'short'}).replace('.',''),t:dfmt(b.date,{weekday:'short',day:'numeric',month:'short'}),y:b.fat}));
   const Wa=pts.filter(b=>b.waist).map(b=>({x:dfmt(b.date,{day:'numeric',month:'short'}).replace('.',''),t:dfmt(b.date,{weekday:'short',day:'numeric',month:'short'}),y:b.waist}));
   const C=calories();const g=GOALS[P.goal]||GOALS.maintain;
-  return `<div class="hero"><div class="prof-hero"><div class="coach-av">${avatarHTML()}</div><div class="grow"><h2 class="script">${P.name?L('Salut ','Hi ')+esc(P.name)+L(' !','!'):L('Ton profil','Your profile')}</h2><p>${[P.sex?(P.sex==='f'?L('Femme','Woman'):L('Homme','Man')):'',P.birth?(new Date().getFullYear()-P.birth)+L(' ans',' y/o'):'',P.height?P.height+' cm':''].filter(Boolean).join(' · ')||L('Complète tes infos pour le calcul des calories','Fill in your details for the calorie calculator')}</p><p style="color:var(--acc);font-weight:700">${IC.flame.replace('class="ico"','class="ico" style="width:15px;height:15px;display:inline;vertical-align:-2px"')} ${esc(g[0])}</p></div></div>
+  return `<div class="hero"><div class="prof-hero"><div class="coach-av">${avatarHTML()}</div><div class="grow"><h2 class="script">${P.name?L('Salut ','Hi ')+esc(P.name)+L(' !','!'):L('Ton profil','Your profile')}</h2><p>${[P.sex?(P.sex==='f'?L('Femme','Woman'):L('Homme','Man')):'',P.birth?(new Date().getFullYear()-P.birth)+L(' ans',' y/o'):'',P.height?P.height+' cm':''].filter(Boolean).join(' · ')||L('Complète tes infos pour le calcul des calories','Fill in your details for the calorie calculator')}</p><p style="color:var(--acc);font-weight:700">${IC.flame.replace('class="ico"','class="ico" style="width:15px;height:15px;display:inline;vertical-align:-2px"')} ${esc(goalName(P.goal))}</p></div></div>
    <button class="btn sm block" style="margin-top:14px" data-act="profedit">${IC.note} Modifier mes infos</button></div>
    <div class="section-t">Poids & mensurations</div>
    <div class="card"><div class="row"><div class="grow"><div class="bignum">${last?fmtNum(last.weight)+' <span style="font-size:18px">kg</span>':'—'}</div>
@@ -1277,11 +1317,26 @@ function profileHTML(){
      +`<div class="list">${B.slice(0,30).map(b=>`<div class="sww"><button class="swd" data-act="bodydel" data-id="${b.id}">${IC.trash}Supprimer</button><div class="li swb"><div class="grow"><b>${fmtNum(b.weight)} kg</b><span>${dfmt(b.date,{weekday:'long',day:'numeric',month:'long',year:'numeric'})}${b.fat?' · '+fmtNum(b.fat)+' %':''}${b.waist?' · '+fmtNum(b.waist)+' cm':''}</span></div></div></div>`).join('')}</div>`:''}
    <div class="section-t">Calories & macros</div>
    <div class="card">
-    <div class="seg">${Object.entries(GOALS).map(([k,v])=>`<button class="${P.goal===k?'on':''}" data-act="goal" data-id="${k}">${v[0]}</button>`).join('')}</div>
-    ${C?`<div style="text-align:center;margin:16px 0 4px"><div class="kcal">${C.kcal.toLocaleString(LOC())}</div><div class="small muted">${L('kcal par jour pour ton objectif','kcal per day for your goal')}</div></div>
+    <div class="chips wrap">${Object.keys(GOALS).map(k=>`<button class="chip ${P.goal===k?'on':''}" data-act="goal" data-id="${k}">${goalName(k)}</button>`).join('')}</div>
+    ${C?(()=>{const T=weightTrend(Date.now()-28*864e5);const sg=v=>(v>0?'+':'')+fmtNum(Math.round(v*100)/100);const lg=P.adjLog[0];
+     return `<div style="text-align:center;margin:16px 0 4px"><div class="kcal">${C.kcal.toLocaleString(LOC())}</div><div class="small muted">${L('kcal par jour pour ton objectif','kcal per day for your goal')}${C.floored?' · '+L('plancher de sécurité','safety floor'):''}</div></div>
      <div class="macro"><div><b>${C.prot} g</b><span>${L('Protéines','Protein')}</span><i style="background:#6AA8FF"></i></div><div><b>${C.carbs} g</b><span>${L('Glucides','Carbs')}</span><i style="background:var(--acc)"></i></div><div><b>${C.fat} g</b><span>${L('Lipides','Fat')}</span><i style="background:#FFB547"></i></div></div>
-     <div style="margin-top:12px"><div class="kline"><span>${L('Métabolisme de base','Basal metabolic rate')}</span><b>${C.bmr.toLocaleString(LOC())} kcal</b></div><div class="kline"><span>${L('Dépense quotidienne estimée','Estimated daily expenditure')}</span><b>${C.tdee.toLocaleString(LOC())} kcal</b></div><div class="kline"><span>${L('Ajustement objectif','Goal adjustment')}</span><b>${g[1]>0?'+':''}${Math.round(g[1]*100)} %</b></div></div>
-     <div class="small muted" style="margin-top:10px">${L(`Estimation (formule de Mifflin-St Jeor) basée sur ${fmtNum(C.w)} kg, ${C.age} ans et ton niveau d’activité. Ajuste selon l’évolution de ton poids sur 2 à 3 semaines ; pour un suivi médical ou une situation particulière, demande l’avis d’un professionnel de santé.`,`Estimate (Mifflin-St Jeor formula) based on ${fmtNum(C.w)} kg, ${C.age} years and your activity level. Adjust based on how your weight changes over 2–3 weeks; for medical follow-up or special situations, ask a health professional.`)}</div>`
+     <div style="margin-top:12px">
+      <div class="kline"><span>${L('Métabolisme de base','Basal metabolic rate')}<br><small>${C.formula==='katch'?L(`Katch-McArdle (masse grasse ${fmtNum(C.fatPct)} %)`,`Katch-McArdle (body fat ${fmtNum(C.fatPct)} %)`):'Mifflin-St Jeor'}</small></span><b>${C.bmr.toLocaleString(LOC())} kcal</b></div>
+      <div class="kline"><span>${L('Vie quotidienne','Daily life')} (×${fmtNum(C.jobF)})<br><small>${esc(L(JOBS[P.job]?.[1],JOBS[P.job]?.[3])||'')}</small></span><b>${C.daily.toLocaleString(LOC())} kcal</b></div>
+      <div class="kline"><span>${L('Entraînements','Training')}<br><small>${C.train.from==='history'?L(`moyenne de tes ${C.train.n} séances sur 4 semaines`,`average of your ${C.train.n} sessions over 4 weeks`):L(`estimation : ${C.train.n} séance(s) par semaine`,`estimate: ${C.train.n} session(s) per week`)}</small></span><b>+${C.train.kcal.toLocaleString(LOC())} kcal</b></div>
+      <div class="kline"><span>${L('Dépense estimée','Estimated expenditure')}</span><b>${C.tdee.toLocaleString(LOC())} kcal</b></div>
+      <div class="kline"><span>${L('Objectif','Goal')} · ${esc(goalName(P.goal))}</span><b>${C.goalPct>0?'+':''}${Math.round(C.goalPct*100)} %</b></div>
+      ${P.autoCal?`<div class="kline"><span>${L('Ajustement automatique','Automatic adjustment')}</span><b style="color:${C.adj?'var(--acc)':'inherit'}">${C.adj>0?'+':''}${C.adj} kcal</b></div>`:''}
+     </div>
+     <div class="card" style="background:var(--card2);margin:12px 0 0;padding:12px">
+      <div class="row"><b class="grow">${L('Calibrage par tes pesées','Calibration from your weigh-ins')}</b><label class="switch" style="padding:0"><input type="checkbox" data-act="autocal" ${P.autoCal?'checked':''}></label></div>
+      <div class="small muted" style="margin-top:6px">${T?L(`Tendance sur ${T.days} jours : <b style="color:var(--txt)">${sg(T.perWeek)} kg/sem</b> · objectif : ${sg(C.targetRate)} kg/sem.`,`${T.days}-day trend: <b style="color:var(--txt)">${sg(T.perWeek)} kg/wk</b> · goal: ${sg(C.targetRate)} kg/wk.`):L('Pèse-toi 2 à 3 fois par semaine, idéalement le matin à jeun : après 2 semaines, l’app compare ta tendance réelle à ton objectif et corrige la cible.','Weigh yourself 2–3 times a week, ideally in the morning before eating: after 2 weeks the app compares your real trend with your goal and corrects the target.')}
+      ${lg?`<br>${L('Dernier calibrage','Last calibration')} (${dfmt(lg.at,{day:'numeric',month:'short'})}) : ${lg.delta?`<b style="color:var(--acc)">${lg.delta>0?'+':''}${lg.delta} kcal</b>`:L('aucun changement nécessaire','no change needed')}.`:''}
+      ${P.autoCal?`<br>${L('L’ajustement suppose que tu suis la cible affichée. Il est réévalué au plus toutes les 2 semaines, par petites étapes (±300 kcal max).','The adjustment assumes you follow the target shown. It is re-evaluated at most every 2 weeks, in small steps (±300 kcal max).')}`:''}</div>
+      ${P.calAdj?`<button class="link" data-act="calreset" style="padding:8px 0 0;font-size:13px">${L('Réinitialiser l’ajustement','Reset the adjustment')}</button>`:''}
+     </div>
+     <div class="small muted" style="margin-top:10px">${L('Estimation à affiner avec le calibrage. Pour un suivi médical ou une situation particulière (grossesse, pathologie…), demande l’avis d’un professionnel de santé.','An estimate refined by calibration. For medical follow-up or special situations (pregnancy, health condition…), ask a health professional.')}</div>`})()
     :`<div class="small muted" style="margin-top:12px">${L('Pour calculer tes besoins, il me faut ton sexe, ton année de naissance, ta taille et au moins une pesée.','To calculate your needs, I need your sex, birth year, height and at least one weigh-in.')}</div><button class="btn primary sm block" style="margin-top:10px" data-act="${!last?'bodyadd':'profedit'}">${!last?L('Ajouter une pesée','Add a weigh-in'):L('Compléter mes infos','Complete my details')}</button>`}
    </div>
    <div class="section-t">Coach</div>
@@ -1301,7 +1356,7 @@ function bodySheet(){
   wheel(sh.el.querySelector('#bw2'),{label:L('Décimale','Decimal'),unit:'kg',min:0,max:9,step:1,value:wd,onChange:v=>{wd=Math.round(v)}});
   sh.el.querySelector('#ok').onclick=()=>{const dv=sh.el.querySelector('#bd').value;const dt=dv?new Date(dv+'T'+(dv===iso?new Date().toTimeString().slice(0,5):'08:00')).getTime():Date.now();
     S.body.push({id:'b-'+uid(),date:dt,weight:Math.round((wi+wd/10)*10)/10,fat:parseNum(sh.el.querySelector('#bf').value)||'',waist:parseNum(sh.el.querySelector('#bt').value)||''});
-    save();sh.close();render();toast(L('Pesée enregistrée','Weigh-in saved'))};
+    save();sh.close();const a=adaptCalories();render();toast(a?L(`Pesée enregistrée · calories ajustées ${a.delta>0?'+':''}${a.delta} kcal`,`Weigh-in saved · calories adjusted ${a.delta>0?'+':''}${a.delta} kcal`):L('Pesée enregistrée','Weigh-in saved'))};
 }
 function profileSheet(){
   const P={...S.profile};
@@ -1310,10 +1365,11 @@ function profileSheet(){
   const draw=()=>{body.innerHTML=`<label class="lbl" style="margin-top:0">${L('Prénom','First name')}</label><input class="field" id="pn" value="${esc(P.name)}" autocomplete="given-name">
     <label class="lbl">${L('Sexe (pour le calcul des calories)','Sex (for the calorie calculation)')}</label><div class="seg">${[['h',L('Homme','Man')],['f',L('Femme','Woman')]].map(([k,l])=>`<button data-s="${k}" class="${P.sex===k?'on':''}">${l}</button>`).join('')}</div>
     <div class="row" style="gap:8px"><div class="grow"><label class="lbl">${L('Année de naissance','Birth year')}</label><input class="field" id="py" inputmode="numeric" placeholder="1990" value="${esc(P.birth)}"></div><div class="grow"><label class="lbl">${L('Taille (cm)','Height (cm)')}</label><input class="field" id="ph" inputmode="numeric" placeholder="178" value="${esc(P.height)}"></div></div>
-    <label class="lbl">${L('Niveau d’activité','Activity level')}</label>${ACT.map(([v,l,d])=>`<button class="opt ${+P.activity===v?'on':''}" data-v="${v}"><div class="grow"><b>${l}</b><span>${d}</span></div></button>`).join('')}
-    <label class="lbl">${L('Objectif','Goal')}</label><div class="seg">${Object.entries(GOALS).map(([k,v])=>`<button data-g="${k}" class="${P.goal===k?'on':''}">${v[0]}</button>`).join('')}</div>`};
+    <label class="lbl">${L('Activité au travail / au quotidien','Activity at work / daily life')}</label>${Object.entries(JOBS).map(([k,v])=>`<button class="opt ${P.job===k?'on':''}" data-j="${k}"><div class="grow"><b>${L(v[1],v[3])}</b><span>${L(v[2],v[4])}</span></div></button>`).join('')}
+    <div class="nrow" style="margin-top:12px;border:0"><span class="grow">${L('Séances par semaine (estimation de départ)','Sessions per week (initial estimate)')}<br><small class="muted" style="font-weight:500">${L('Remplacé par ton historique réel dès 2 séances','Replaced by your real history after 2 sessions')}</small></span><button data-sw="-1">−</button><b>${P.sessW||0}</b><button data-sw="1">+</button></div>
+    <label class="lbl">${L('Objectif','Goal')}</label><div class="chips wrap">${Object.keys(GOALS).map(k=>`<button class="chip ${P.goal===k?'on':''}" data-g="${k}">${goalName(k)}</button>`).join('')}</div>`};
   const keep=()=>{const q=x=>body.querySelector(x);if(q('#pn')){P.name=q('#pn').value.trim();P.birth=q('#py').value.trim();P.height=q('#ph').value.trim()}};
-  body.addEventListener('click',ev=>{const b=ev.target.closest('[data-s],[data-v],[data-g]');if(!b)return;keep();hap();if(b.dataset.s)P.sex=b.dataset.s;if(b.dataset.v)P.activity=+b.dataset.v;if(b.dataset.g)P.goal=b.dataset.g;draw()});
+  body.addEventListener('click',ev=>{const b=ev.target.closest('[data-s],[data-j],[data-g],[data-sw]');if(!b)return;keep();hap();if(b.dataset.s)P.sex=b.dataset.s;if(b.dataset.j)P.job=b.dataset.j;if(b.dataset.g)P.goal=b.dataset.g;if(b.dataset.sw)P.sessW=Math.max(0,Math.min(14,(+P.sessW||0)+ +b.dataset.sw));draw()});
   draw();
   sh.el.querySelector('#ok').onclick=()=>{keep();const y=+P.birth,hh=+P.height;
     if(P.birth&&!(y>1920&&y<=new Date().getFullYear()-10)){toast(L('Année de naissance invalide','Invalid birth year'));return}
@@ -1932,7 +1988,9 @@ const A={
   bodydel:c=>{const i=S.body.findIndex(b=>b.id===c.id);if(i<0)return;const [old]=S.body.splice(i,1);tomb(old.id);save();render();toast('Pesée supprimée',()=>{delete S.deleted[old.id];old.u=Date.now();S.body.push(old);save();render()})},
   bodyp:c=>{ui.bodyP=c.id;hap();render()},
   profedit:()=>profileSheet(),
-  goal:c=>{S.profile.goal=c.id;hap();save();render()},
+  goal:c=>{if(S.profile.goal!==c.id){S.profile.goal=c.id;S.profile.calAdj=0;S.profile.adjAt=Date.now()}hap();save();render()},
+  autocal:c=>{S.profile.autoCal=c.a.checked;if(S.profile.autoCal&&!S.profile.adjAt)S.profile.adjAt=0;save();render()},
+  calreset:()=>{S.profile.calAdj=0;S.profile.adjAt=Date.now();save();render();toast(L('Ajustement réinitialisé','Adjustment reset'))},
   avatar:c=>{S.profile.avatar=c.id;S.profile.coach=c.id!=='none';hap();save();render()},
   fold:c=>{const id=c.itemId;ui.open.has(id)?ui.open.delete(id):ui.open.add(id);hap();render()},
   delitem:c=>{const x=ctxOf(c);if(!x)return;const it=x.obj.items.find(i=>i.id===c.itemId);const undo=snapshot(c);x.obj.items=x.obj.items.filter(i=>i.id!==c.itemId);save();render();toast((isH(it)?'Bloc':isG(it)?'Groupe':'Exercice')+' supprimé',undo)},
@@ -2238,7 +2296,7 @@ function settingsSheet(){
     <label class="switch"><input type="checkbox" id="kw" ${st.keepAwake?'checked':''}><span>Garder l’écran allumé pendant la séance</span></label>
     <label class="switch" style="border-top:1px solid var(--line)"><input type="checkbox" id="vo" ${st.voice?'checked':''}><span>Annonces vocales du timer HIIT</span></label>
    </div>
-   <div class="small muted" style="margin:22px 4px 0;text-align:center">Forge v7 · ${S.exercises.filter(e=>!e.archived).length} exercices · ${sessions().length} séances</div>
+   <div class="small muted" style="margin:22px 4px 0;text-align:center">Forge v8 · ${S.exercises.filter(e=>!e.archived).length} exercices · ${sessions().length} séances</div>
   </div>`);
   const q=s=>sh.el.querySelector(s);
   const err=m=>{const e=q('#ferr');if(e){e.textContent=m;e.style.display='block'}else toast(m)};
