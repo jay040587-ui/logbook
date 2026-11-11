@@ -1947,7 +1947,7 @@ function settingsSheet(){
     <label class="switch"><input type="checkbox" id="kw" ${st.keepAwake?'checked':''}><span>Garder l’écran allumé pendant la séance</span></label>
     <label class="switch" style="border-top:1px solid var(--line)"><input type="checkbox" id="vo" ${st.voice?'checked':''}><span>Annonces vocales du timer HIIT</span></label>
    </div>
-   <div class="small muted" style="margin:22px 4px 0;text-align:center">Forge · ${S.exercises.filter(e=>!e.archived).length} exercices · ${sessions().length} séances</div>
+   <div class="small muted" style="margin:22px 4px 0;text-align:center">Forge v6 · ${S.exercises.filter(e=>!e.archived).length} exercices · ${sessions().length} séances</div>
   </div>`);
   const q=s=>sh.el.querySelector(s);
   const err=m=>{const e=q('#ferr');if(e){e.textContent=m;e.style.display='block'}else toast(m)};
